@@ -16,9 +16,14 @@ use flashblocks_node::{
     engine::FlashblocksEngineApiBuilder, payload::FlashblocksPayloadBuilderBuilder,
     payload_service::FlashblocksPayloadServiceBuilder,
 };
-use flashblocks_p2p::{net::FlashblocksNetworkBuilder, protocol::handler::FlashblocksHandle};
+use flashblocks_p2p::{
+    monitor::PeerMonitor,
+    protocol::handler::{FlashblocksHandle, FlashblocksP2PProtocol},
+};
 use flashblocks_primitives::p2p::Authorization;
 use flashblocks_rpc::eth::FlashblocksEthApiBuilder;
+use hex::ToHex;
+use reth_network::protocol::IntoRlpxSubProtocol;
 use reth_node_api::{FullNodeTypes, NodeTypes};
 use reth_node_builder::{
     NodeAdapter, NodeComponentsBuilder,
@@ -32,6 +37,7 @@ use reth_optimism_node::{
 };
 use reth_optimism_rpc::OpEthApiBuilder;
 
+use tracing::info;
 use world_chain_payload::context::WorldChainPayloadBuilderCtxBuilder;
 use world_chain_pool::BasicWorldChainPool;
 
@@ -42,13 +48,17 @@ use reth_network_peers::PeerId;
 use reth_node_builder::{BuilderContext, components::NetworkBuilder};
 use reth_transaction_pool::{PoolTransaction, TransactionPool};
 
-/// Network builder for World Chain that optionally applies custom transaction propagation policy.
+/// Network builder for World Chain that optionally applies custom transaction propagation policy
+/// and registers the flashblocks P2P sub-protocol.
 ///
-/// Extends OpNetworkBuilder to support restricting transaction gossip to specific peers.
+/// Extends OpNetworkBuilder to support restricting transaction gossip to specific peers
+/// and ensures the flashblocks "flblk" capability is registered on the NetworkManager
+/// before the network starts connecting to peers.
 #[derive(Debug, Clone)]
 pub struct WorldChainNetworkBuilder {
     op_network_builder: OpNetworkBuilder,
     tx_peers: Option<Vec<PeerId>>,
+    flashblocks_p2p_handle: Option<FlashblocksHandle>,
 }
 
 impl WorldChainNetworkBuilder {
@@ -56,6 +66,7 @@ impl WorldChainNetworkBuilder {
         disable_txpool_gossip: bool,
         disable_discovery_v4: bool,
         tx_peers: Option<Vec<PeerId>>,
+        flashblocks_p2p_handle: Option<FlashblocksHandle>,
     ) -> Self {
         let op_network_builder = OpNetworkBuilder {
             disable_txpool_gossip,
@@ -65,6 +76,7 @@ impl WorldChainNetworkBuilder {
         Self {
             op_network_builder,
             tx_peers,
+            flashblocks_p2p_handle,
         }
     }
 }
@@ -86,12 +98,32 @@ where
         ctx: &BuilderContext<Node>,
         pool: Pool,
     ) -> eyre::Result<Self::Network> {
-        let network_config = self.op_network_builder.network_config(ctx)?;
+        let Self {
+            op_network_builder,
+            tx_peers,
+            flashblocks_p2p_handle,
+        } = self;
 
-        let network = reth_network::NetworkManager::builder(network_config).await?;
+        let network_config = op_network_builder.network_config(ctx)?;
+
+        let mut network = reth_network::NetworkManager::builder(network_config).await?;
+
+        // Register flashblocks sub-protocol BEFORE starting the network.
+        // This ensures the "flblk" capability is included in the RLPx handshake
+        // for all peer connections, including the very first trusted peer connections.
+        if let Some(ref flashblocks_handle) = flashblocks_p2p_handle {
+            let network_handle = network.handle();
+            let flashblocks_rlpx = FlashblocksP2PProtocol {
+                network: network_handle,
+                handle: flashblocks_handle.clone(),
+            };
+            network
+                .network_mut()
+                .add_rlpx_sub_protocol(flashblocks_rlpx.into_rlpx_sub_protocol());
+        }
 
         // Start network with custom policy if specified, otherwise use default
-        let handle = if let Some(peers) = self.tx_peers {
+        let handle = if let Some(peers) = tx_peers {
             tracing::info!(
                 target: "world_chain::network",
                 "Applying peer white listing transaction policy. Number of peers: {}",
@@ -114,6 +146,17 @@ where
             "World Chain P2P networking initialized"
         );
 
+        // Set up peer monitor for flashblocks trusted peers
+        if flashblocks_p2p_handle.is_some() {
+            let cli_peers = ctx.config().network.trusted_peers.iter();
+            let toml_peers = ctx.reth_config().peers.trusted_nodes.iter();
+            let all_trusted_peers = cli_peers.chain(toml_peers).map(|peer| peer.id);
+
+            PeerMonitor::new(handle.clone())
+                .with_initial_peers(all_trusted_peers)
+                .run_on_task_executor(ctx.task_executor());
+        }
+
         Ok(handle)
     }
 }
@@ -135,7 +178,7 @@ where
             OpEvmConfig<<<N as FullNodeTypes>::Types as NodeTypes>::ChainSpec>,
         >,
 {
-    type Net = FlashblocksNetworkBuilder<WorldChainNetworkBuilder>;
+    type Net = WorldChainNetworkBuilder;
     type Evm = OpEvmConfig;
     type PayloadServiceBuilder = FlashblocksPayloadServiceBuilder<
         FlashblocksPayloadBuilderBuilder<WorldChainPayloadBuilderCtxBuilder>,
@@ -177,8 +220,16 @@ where
             ..
         } = rollup;
 
-        let wc_network_builder =
-            WorldChainNetworkBuilder::new(disable_txpool_gossip, !discovery_v4, tx_peers);
+        let wc_network_builder = WorldChainNetworkBuilder::new(
+            disable_txpool_gossip,
+            !discovery_v4,
+            tx_peers,
+            components_context
+                .as_ref()
+                .map(|flashblocks_components_ctx| {
+                    flashblocks_components_ctx.flashblocks_handle.clone()
+                }),
+        );
 
         let (
             flashblocks_interval,
@@ -197,15 +248,6 @@ where
             // the compiler work fine.
             (200, 200, None, false)
         };
-
-        let fb_network_builder = FlashblocksNetworkBuilder::new(
-            wc_network_builder,
-            components_context
-                .as_ref()
-                .map(|flahsblocks_components_ctx| {
-                    flahsblocks_components_ctx.flashblocks_handle.clone()
-                }),
-        );
 
         let ctx_builder = WorldChainPayloadBuilderCtxBuilder {
             verified_blockspace_capacity: pbh.verified_blockspace_capacity,
@@ -255,7 +297,7 @@ where
                 Duration::from_millis(flashblocks_interval),
                 Duration::from_millis(flashblocks_recommit_interval),
             ))
-            .network(fb_network_builder)
+            .network(wc_network_builder)
             .consensus(OpConsensusBuilder::default())
     }
 
@@ -348,6 +390,11 @@ impl From<WorldChainNodeConfig> for FlashblocksComponentsContext {
                 .expect("flashblocks authorizer_vk or override_authorizer_sk required")
                 .verifying_key()
         });
+
+        info!(
+            "Flashblocks authorizer_vk: {}",
+            authorizer_vk.as_bytes().encode_hex::<String>()
+        );
 
         let builder_sk = flashblocks.builder_sk.clone();
         let flashblocks_handle = FlashblocksHandle::new(authorizer_vk, builder_sk.clone());
