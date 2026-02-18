@@ -13,7 +13,6 @@ pub struct FlashblocksArgs {
     #[arg(
         long = "flashblocks.enabled",
         id = "flashblocks.enabled",
-        requires = "authorizer",
         required = false
     )]
     pub enabled: bool,
@@ -175,7 +174,7 @@ mod tests {
 
     #[test]
     fn flashblocks_neither() {
-        CommandParser::try_parse_from(["bin", "--flashblocks.enabled"]).unwrap_err();
+        CommandParser::try_parse_from(["bin", "--flashblocks.enabled"]).unwrap();
     }
 
     #[test]
