@@ -28,7 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::broadcast;
-use tracing::{error, trace};
+use tracing::{error, trace, warn};
 
 use crate::{
     bal_executor::CommittedState,
@@ -247,12 +247,20 @@ where
                 .with_max_times(10),
         )
         .notify(|e, duration| {
-            error!(
+            warn!(
                 "waiting for parent header {}: {e:#?}. waited {:#?} so far",
                 base.parent_hash, duration
             )
         })
-        .call()?;
+        .call()
+        .inspect_err(|e| {
+            error!(
+                flashblock_index = index,
+                parent_hash = %base.parent_hash,
+                error = %e,
+                "failed to fetch parent header after multiple attempts"
+            )
+        })?;
 
     let execution_context = OpBlockExecutionCtx {
         parent_hash: base.parent_hash,
